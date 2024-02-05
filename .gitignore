@@ -1,0 +1,14 @@
+# .gitignore
+/dataset/UCF-101/*
+
+# Ignore .npy files
+*.npy
+
+# Ignore log files
+*.log
+src/logs
+
+# Ignore temporary files
+*.tmp
+
+*.idea
