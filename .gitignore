@@ -12,3 +12,4 @@ src/logs
 *.tmp
 
 *.idea
+*__pycache__*
