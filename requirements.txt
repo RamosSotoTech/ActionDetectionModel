@@ -1,0 +1,16 @@
+<<<<<<< HEAD
+opencv-python~=4.9.0.80
+tensorflow~=2.15.0.post1
+numpy~=1.26.2
+keras~=2.15.0
+scikit-learn~=1.3.2
+pandas~=2.1.3
+typing_extensions~=4.8.0
+Pillow~=10.1.0
+=======
+opencv-python~=4.9.0.80
+tensorflow~=2.15.0.post1
+numpy~=1.26.2
+keras~=2.15.0
+scikit-learn~=1.3.2
+>>>>>>> parent of 4d41ba2 (Add video handling and preprocessing scripts)

@@ -1,0 +1,20 @@
+# .gitignore
+/dataset/UCF-101/*
+logs/*
+**/pycache/*
+
+# Ignore .npy files
+*.npy
+
+# Ignore log files
+*.log
+src/logs
+
+# Ignore temporary files
+*.tmp
+
+*.idea
+*.keras
+*.pyc
+*.h5
+*.npy
