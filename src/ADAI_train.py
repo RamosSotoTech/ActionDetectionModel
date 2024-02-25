@@ -19,13 +19,13 @@ from tensorflow.keras.utils import custom_object_scope
 
 # updated hyperparameters
 best_hyperparameters = {'lstm_units': 512, 'dense_units': 1024, 'dropout_rate': 0.5, 'fine_tune_at': 4,
-                        'num_frames': 10, 'tuner/epochs': 4, 'tuner/initial_epoch': 2, 'tuner/bracket': 2,
+                        'num_frames': 1, 'tuner/epochs': 4, 'tuner/initial_epoch': 2, 'tuner/bracket': 2,
                         'tuner/round': 1, 'tuner/trial_id': '0005'}
 
 SEQUENCE_LENGTH = best_hyperparameters['num_frames']
-BATCH_SIZE = 4
+BATCH_SIZE = 1
 EPOCHS = 100
-MODEL_SAVE_PATH = 'model_checkpoint.keras'
+MODEL_SAVE_PATH = '_model_checkpoint.keras'
 DROP_RATE = best_hyperparameters['dropout_rate']
 TRAINING_DATASET = [1]
 VALIDATION_DATASET = [3]

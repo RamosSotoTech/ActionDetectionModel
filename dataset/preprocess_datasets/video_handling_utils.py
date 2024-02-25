@@ -5,11 +5,42 @@ import numpy as np
 import tensorflow as tf
 
 
+class FrameFetchingStrategy:
+    def fetch_frame(self, video):
+        raise NotImplementedError("Subclass must implement the fetch_frame method.")
+
+
+class FetchEveryFrameStrategy(FrameFetchingStrategy):
+    def fetch_frame(self, video):
+        ret, frame = video.read()
+        return ret, frame
+
+
+class FetchEveryNthFrameStrategy(FrameFetchingStrategy):
+    def __init__(self, n=1):
+        self.n = n  # Skip every n frames
+        self.counter = 0
+
+    def fetch_frame(self, video):
+        ret, frame = None, None
+        while self.counter < self.n:
+            ret, frame = video.read()
+            self.counter += 1
+        self.counter = 0  # Reset counter after nth frame is fetched
+        return ret, frame
+
+
 class VideoProcessor:
-    def __init__(self, file_path, preprocessing=None):
+    def __init__(self, file_path, preprocessing=None, target_shape=None, target_fps=30, fetch_method=None):
         self.video = None
         self.file_path = file_path
         self.preprocessing = preprocessing
+        self.target_shape = target_shape
+        self.target_fps = target_fps
+        if fetch_method is None:
+            self.frame_fetching_strategy = FetchEveryFrameStrategy()  # Default strategy
+        else:
+            self.frame_fetching_strategy = fetch_method
         try:
             self.video = cv2.VideoCapture(self.file_path)
             if not self.video.isOpened():
@@ -42,10 +73,13 @@ class VideoProcessor:
         if self.current_frame >= self.total_frames:
             self.video.release()
             raise StopVideoIteration
-        ret, frame = self.video.read()
-        if not ret:
-            self.video.release()
-            raise StopVideoIteration
+        if self.frame_fetching_strategy is not None:
+            frame = self.frame_fetching_strategy(self.video)
+        else:
+            ret, frame = self.video.read()
+            if not ret:
+                self.video.release()
+                raise StopVideoIteration
         self.current_frame += 1
 
         # Apply preprocessing here, if any
@@ -57,6 +91,10 @@ class VideoProcessor:
     def __del__(self):
         if self.video is not None and self.video.isOpened():
             self.video.release()
+
+    def number_remaining_frames(self):
+        return self.total_frames - self.current_frame
+
 
 
 class StopVideoIteration(Exception):
@@ -379,6 +417,7 @@ class ContinuousBatchVideoProcessor:
 
         for i in range(self.batch_size):
             frames_fetched = 0
+            # check if remaining frames are less than the required frames per batch
             while frames_fetched < self.frames_per_batch:
                 if self.finished_current_video:
                     frame = self.padding_frame

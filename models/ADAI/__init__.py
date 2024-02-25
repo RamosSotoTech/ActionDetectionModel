@@ -24,7 +24,7 @@ class SpatialAttentionLayer(Layer):
                                                 kernel_initializer='he_normal', use_bias=False)
 
         # Pointwise convolution to combine the depthwise convolution outputs
-        self.pointwise_conv2d = Conv2D(filters=self.filters, kernel_size=(1, 1), padding='same',
+        self.pointwise_conv2d = Conv2D(filters=self.filters, kernel_size=(1, 1), padding=self.padding,
                                        kernel_initializer='he_normal', use_bias=False)
 
         self.batch_norm = BatchNormalization()
@@ -100,7 +100,44 @@ class SelectiveResetLSTM(tf.keras.layers.LSTM):
         return super().call(inputs, training=training, mask=mask, initial_state=initial_state)
 
 
+# phase 1: train by sequence of frames, stateless LSTM
+def ActionDetectionModel_Phase1(num_frames, frame_width, frame_height, channels, num_classes, lstm_units=256,
+                         dense_units=1024, dropout_rate=0.5, fine_tune_until=None):
+    # Video frame input
+    video_input = Input(shape=(num_frames, frame_height, frame_width, channels), name='video_input')
+
+    # Load the VGG19 model
+    base_model = VGG19(include_top=False, weights='imagenet', input_shape=(frame_height, frame_width, channels))
+    if fine_tune_until:
+        for layer in base_model.layers[:-fine_tune_until]:
+            layer.trainable = False
+
+    # TimeDistributed VGG19 model for frame feature extraction
+    td_base_model = TimeDistributed(base_model)(video_input)
+    td_attention = TimeDistributed(SpatialAttentionLayer(filters=512, kernel_size=(3, 3), activation='relu'))(
+        td_base_model)
+    td_pooling = TimeDistributed(GlobalAveragePooling2D())(td_attention)
+    td_flatten = TimeDistributed(Flatten())(td_pooling)
+
+    lstm = LSTM(lstm_units, return_sequences=False, stateful=False, dropout=0.5, recurrent_dropout=0.5,
+                kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4),
+                recurrent_regularizer=l1_l2(l1=1e-5, l2=1e-4),
+                bias_regularizer=l1_l2(l2=1e-4), name='lstm')(td_flatten)
+
+    # Following layers
+    batch_norm = BatchNormalization()(lstm)
+    dense_layer = Dense(dense_units, activation='relu')(batch_norm)
+    dropout = Dropout(dropout_rate)(dense_layer)
+    predictions = Dense(num_classes, activation='softmax')(dropout)
+
+    # Construct the final model
+    model = Model(inputs=video_input, outputs=predictions)
+
+    return model
+
 # todo: Create graph of the model for the documentation
+# todo: Add the Masking layer to enable ignoring padding frames, and allow for batch training
+# phase 2: train by sequence of videos. Stateful LSTM
 def ActionDetectionModel(batch_size, num_frames, frame_width, frame_height, channels, num_classes, lstm_units=256,
                          dense_units=1024, dropout_rate=0.5, fine_tune_until=None):
     # Video frame input
@@ -210,4 +247,3 @@ def ActionDetectionModel(batch_size, num_frames, frame_width, frame_height, chan
 #         self.compiled_metrics.update_state(y_batch_val, y_pred_val)
 #
 #         return {m.name: m.result() for m in self.metrics}
-

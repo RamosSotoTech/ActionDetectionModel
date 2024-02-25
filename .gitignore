@@ -7,9 +7,14 @@
 # Ignore log files
 *.log
 src/logs
+logs
 
 # Ignore temporary files
 *.tmp
 
 *.idea
 *__pycache__*
+**/__pycache__*
+*.pb
+*.keras
+*.h5
