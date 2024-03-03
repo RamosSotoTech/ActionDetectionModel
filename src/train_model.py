@@ -1,123 +1,68 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+from threading import Thread
+from typing import Optional, Tuple, List, Any
+
 import cv2
 import numpy as np
 from keras.src.applications.vgg19 import preprocess_input
+from tensorflow import Tensor
+import queue
+from tensorflow.data import Dataset
 from tensorflow.keras.optimizers import AdamW
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.models import load_model
 from tensorflow.keras.optimizers.schedules import ExponentialDecay
-from tensorflow.keras import backend as K
-import datetime
 import random
 import tensorflow as tf
-from pathlib import Path
-from typing import List
-import pandas as pd
-from queue import Queue
-from threading import Thread
-import math
 import keras_cv
 import concurrent.futures
 
-from tensorflow.keras.callbacks import Callback
 from tensorflow.keras.callbacks import TensorBoard
 
 from dataset.preprocess_datasets.data_iterator import get_train_test_size
 from models.ADAI import ActionDetectionModel, SpatialAttentionLayer, TemporalAttentionLayer
-from tensorflow.keras.utils import custom_object_scope
+from dataset.preprocess_datasets.testing_generators import get_data_for_loading
 
-from tensorflow.keras.mixed_precision import set_global_policy
-
-set_global_policy('mixed_float16')
-
-# updated hyperparameters
-best_hyperparameters = {'lstm_units': 512, 'dense_units': 1024, 'dropout_rate': 0.5, 'fine_tune_at': 4,
-                        'num_frames': 25, 'tuner/epochs': 4, 'tuner/initial_epoch': 2, 'tuner/bracket': 2,
-                        'tuner/round': 1, 'tuner/trial_id': '0005'}
+best_hyperparameters = {'lstm_units': 1024, 'dense_units': 256, 'dropout_rate': 0.5, 'fine_tune_at': 4,
+                        'num_frames': 25}
 
 SEQUENCE_LENGTH = best_hyperparameters['num_frames']
 BATCH_SIZE = 1
 EPOCHS = 100
-MODEL_SAVE_PATH = '_model_checkpoint.keras'
+MODEL_SAVE_PATH = '../models/previous models/model_trained_by_sequence.keras'
 DROP_RATE = best_hyperparameters['dropout_rate']
 TRAINING_DATASET = [1, 2, 3]
-# VALIDATION_DATASET = [3]
-
-from dataset.preprocess_datasets.testing_generators import get_data_for_loading
-from dataset.preprocess_datasets.video_handling import ContinuousVideoProcessor, VideoProcessor
 
 train_paths, test_paths = get_data_for_loading(TRAINING_DATASET)
 train_size, test_size = get_train_test_size(TRAINING_DATASET)
 
 
-def calculate_video_accuracy(predictions_accumulated, labels_accumulated):
-    all_predictions = np.concatenate(predictions_accumulated, axis=0)
-    all_labels = np.concatenate(labels_accumulated, axis=0)
-    correct_predictions = np.sum(np.argmax(all_predictions, axis=0) == np.argmax(all_labels, axis=0))
-    total_items = len(all_labels)
-    return correct_predictions / total_items if total_items > 0 else 0
-
-
-import threading
-import functools
-
-
 class VideoProcessor:
-    def __init__(self, file_path, preprocessing=None, target_shape=None, training=False):
+    def __init__(self, file_path: str, target_shape: Optional[Tuple[int, int, int]] = (240, 320, 3),
+                 frame_buffer_size: int = 200, training: bool = True):
+        """
+        Initializes the object with the given file path and target shape.
+
+        :param file_path: The path of the video file.
+        :param target_shape: The desired shape of the video frames as a tuple of width and height.
+        """
         self.video = None
+        self.original_frame_rate = None
+        self.frame_width = None
+        self.frame_height = None
+        self.total_frames = None
         self.file_path = file_path
-        self.preprocessing = preprocessing
         self.target_shape = target_shape
-        self.training = training
-        self.lock = threading.Lock()
         self.current_frame = 0
+        self.training = training
 
-    def get_metadata(self):
-        return {
-            'original_frame_rate': self.original_frame_rate,
-            'frame_width': self.frame_width,
-            'frame_height': self.frame_height,
-            'total_frames': self.total_frames,
-        }
-
-    def fetch_sequence(self, num_frames):
-        sequence = []
-        while len(sequence) < num_frames and self.current_frame < self.total_frames:
-            ret, frame = self.video.read()
-            if not ret:
-                break  # Stop if no frame is read
-            if self.preprocessing is not None:
-                frame = cv2.resize(frame, (self.target_shape[1], self.target_shape[0]))
-                frame = self.preprocessing(frame)
-            if self.training:
-                frame = self.apply_augmentation(frame)
-            sequence.append(frame)
-            self.current_frame += 1
-
-        return tf.stack(sequence)
-
-    def standardize_fetch(self, fps_target, num_frames):
-        sequence = []
-        frame_interval = self.original_frame_rate / fps_target  # Calculate the interval between frames to fetch
-
-        target_frame_indices = [int(round(self.current_frame + i * frame_interval)) for i in range(num_frames)]
-        last_fetched_index = -1  # Keep track of the last fetched frame index
-
-        for frame_index in target_frame_indices:
-            # Ensure we do not fetch the same frame twice or go backward due to rounding, and do not exceed total frames
-            if last_fetched_index < frame_index < self.total_frames:
-                self.video.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                ret, frame = self.video.read()
-                if not ret:
-                    break  # Stop if no frame is read
-                if self.preprocessing is not None:
-                    frame = self.preprocessing(frame)
-                sequence.append(frame)
-                last_fetched_index = frame_index
-                self.current_frame = frame_index + 1  # Update the current frame to the last one fetched
-
-        return sequence
-
-    def standardize_fetch_generator(self, fps_target, num_frames):
+        self.should_flip: tf.Tensor = tf.random.uniform(shape=[], minval=0, maxval=2, dtype=tf.int32) < 1
+        # Define the RandomRotation layer with a small range (-10 to 10 degrees)
+        # Degrees are specified in fractions of 2π, so 10 degrees is about 10/360 = 0.0277
+        self.rotation_layer: keras_cv.layers.RandomRotation = keras_cv.layers.RandomRotation(factor=(-0.0277, 0.0277))
+        self.should_grayscale: tf.Tensor = tf.random.uniform(shape=[], minval=0, maxval=2, dtype=tf.int32) < 1
         try:
             self.video = cv2.VideoCapture(self.file_path)
             if not self.video.isOpened():
@@ -128,44 +73,67 @@ class VideoProcessor:
             self.total_frames = int(self.video.get(cv2.CAP_PROP_FRAME_COUNT))
         except cv2.error as e:
             raise FileNotFoundError(f"{e}: Could not open video file: {self.file_path}")
-        frame_interval = self.original_frame_rate / fps_target  # Calculate the interval between frames to fetch
+        self.fps_target = 25
+        self.frame_buffer = Queue(maxsize=frame_buffer_size)
+        self.prefetch_thread = Thread(target=self.prefetch_frames, args=(self.fps_target,), daemon=True)
+        self.prefetch_thread.start()
 
-        while True:  # The generator will continue until it can't yield a full sequence
+    def prefetch_frames(self, fps_target):
+        """Function to continuously read, augment, and selectively store frames based on the target FPS."""
+        skip_rate = int(round(self.original_frame_rate / fps_target))
+        frame_count = 0
+
+        while True:
+            ret, frame = self.video.read()
+            if not ret:
+                self.frame_buffer.put(None)  # Signal that the video has ended
+                break
+
+            # Only add frames to the buffer based on the skip rate
+            if frame_count % skip_rate == 0:
+                frame_tensor = tf.convert_to_tensor(frame, dtype=tf.float32)
+                if self.training:
+                    frame_tensor = self.apply_augmentations(frame_tensor)
+
+                frame_tensor = preprocess_input(frame_tensor)
+                frame_tensor = tf.image.resize(frame_tensor, (self.target_shape[0], self.target_shape[1]))
+                frame_tensor = frame_tensor / 255.0  # Normalize the pixel values
+                self.frame_buffer.put(frame_tensor)
+
+            frame_count += 1
+
+    @tf.function
+    def apply_augmentations(self, frame_tensor):
+        # Check conditions outside the frame loop
+        if self.should_flip:
+            frame_tensor = tf.image.flip_left_right(frame_tensor)
+
+        frame_tensor = self.rotation_layer(frame_tensor)  # Rotation is always applied
+
+        # Other augmentations
+        frame_tensor = tf.image.random_hue(frame_tensor, max_delta=0.08)
+        frame_tensor = tf.image.random_saturation(frame_tensor, lower=0.7, upper=1.3)
+        frame_tensor = tf.image.random_brightness(frame_tensor, max_delta=0.05)
+        frame_tensor = tf.image.random_contrast(frame_tensor, lower=0.7, upper=1.3)
+        frame_tensor = frame_tensor + tf.random.normal(tf.shape(frame_tensor), mean=0.0, stddev=0.1)
+
+        if self.should_grayscale:
+            frame_tensor = tf.image.grayscale_to_rgb(tf.image.rgb_to_grayscale(frame_tensor))
+
+        return tf.clip_by_value(frame_tensor, 0.0, 1.0)
+
+    def standardize_fetch_generator(self, num_frames):
+        while True:
             sequence = []
-            # with self.lock:
-            start_frame_index = self.current_frame
-            self.current_frame = int(round(start_frame_index + num_frames * frame_interval))  # Update current_frame
-
-            for i in range(num_frames):
-                target_frame_index = int(round(start_frame_index + i * frame_interval))
-                if target_frame_index >= self.total_frames:
+            for _ in range(num_frames):
+                frame = self.frame_buffer.get()  # Retrieve the next frame from the buffer
+                if frame is None:  # End of video
                     self.video.release()
-                    return  # Stop the generator if there aren't enough frames left
+                    return
 
-                self.video.set(cv2.CAP_PROP_POS_FRAMES, target_frame_index)
-                ret, frame = self.video.read()
-                if not ret:
-                    self.video.release()
-                    return  # Stop the generator if unable to read the frame
-
-                frame = cv2.resize(frame, (self.target_shape[1], self.target_shape[0]))
-
-                # convert frame to tensor
-                frame = tf.convert_to_tensor(frame, dtype=tf.float32)
-                #
-                # if self.preprocessing is not None:
-                #     frame = self.preprocessing(frame)
-                # if self.training:
-                #     frame = self.apply_augmentation(frame)
                 sequence.append(frame)
 
-            # # Stack the sequence and remove the first singleton dimension (if present)
-            sequence_tensor = tf.stack(sequence)
-            # if sequence_tensor.shape[0] == 1:  # Check if the first dimension is singleton
-            #     sequence_tensor = tf.squeeze(sequence_tensor, axis=0)
-
-            # yield tf.expand_dims(sequence_tensor, axis=0)
-            yield sequence_tensor
+            yield sequence
 
     def __del__(self):
         if self.video is not None and self.video.isOpened():
@@ -175,233 +143,286 @@ class VideoProcessor:
         return self.total_frames - self.current_frame
 
 
+class VideoLoader:
+    def __init__(self, video_list, max_queue_size=10, target_shape=(240, 320, 3), training=True):
+        self.video_list = video_list
+        self.queue = Queue(maxsize=max_queue_size)
+        self.stop_signal = False
+        self.target_shape = target_shape
+        self.thread = None  # Initialize the thread reference
+        self.training = training
+
+    def video_loader_thread(self):
+        for video_path, label in self.video_list:
+            if self.stop_signal:
+                break
+            video_sequence, label = create_video_dataset(video_path, label, frame_shape=self.target_shape,
+                                                         training=self.training)
+            try:
+                self.queue.put((video_sequence, label))  # Use a timeout for blocking
+            except queue.Full:
+                print("Queue is full, skipping...")
+        self.stop_signal = True
+
+    def start_loading(self):
+        self.stop_signal = False
+        self.thread = Thread(target=self.video_loader_thread)  # Assign the thread to the instance variable
+        self.thread.start()
+
+    def get_next_video(self):
+        try:
+            if not self.queue.empty() or not self.stop_signal:
+                return self.queue.get(timeout=1)  # Use a timeout to avoid indefinite blocking
+        except queue.Empty:
+            print("Queue is empty...")
+        return None
+
+    def stop_loading(self):
+        self.stop_signal = True
+        if self.thread and self.thread.is_alive():  # Check if the thread has been started and is alive
+            self.thread.join()  # Wait for the thread to finish
+
+        # Optional: Clear the queue to ensure no residual data
+        while not self.queue.empty():
+            self.queue.get()
+
+
+# Metrics
+train_video_accuracy = tf.keras.metrics.CategoricalAccuracy(name='accuracy')
+train_video_recall = tf.keras.metrics.Recall(name='recall')
+train_video_precision = tf.keras.metrics.Precision(name='precision')
+train_video_f1_score = tf.keras.metrics.F1Score(name='f1_score', average='weighted')
+train_seq_accuracy = tf.keras.metrics.CategoricalAccuracy(name='seq_accuracy')
+train_seq_recall = tf.keras.metrics.Recall(name='seq_recall')
+train_seq_precision = tf.keras.metrics.Precision(name='seq_precision')
+train_seq_f1_score = tf.keras.metrics.F1Score(name='seq_f1_score', average='weighted')
+val_video_accuracy = tf.keras.metrics.CategoricalAccuracy(name='val_accuracy')
+val_video_recall = tf.keras.metrics.Recall(name='val_recall')
+val_video_precision = tf.keras.metrics.Precision(name='val_precision')
+val_video_f1_score = tf.keras.metrics.F1Score(name='val_f1_score', average='weighted')
+val_seq_accuracy = tf.keras.metrics.CategoricalAccuracy(name='val_seq_accuracy')
+val_seq_recall = tf.keras.metrics.Recall(name='val_seq_recall')
+val_seq_precision = tf.keras.metrics.Precision(name='val_seq_precision')
+val_seq_f1_score = tf.keras.metrics.F1Score(name='val_seq_f1_score', average='weighted')
+
+# Loss metrics
+train_video_loss_metric = tf.keras.metrics.Mean(name='loss')
+val_video_loss_metric = tf.keras.metrics.Mean(name='val_loss')
+train_sequence_loss_metric = tf.keras.metrics.Mean(name='seq_loss')
+val_sequence_loss_metric = tf.keras.metrics.Mean(name='val_seq_loss')
+
+
+# Loss function
+def focal_loss(gamma=2., alpha=.25, from_logits=False):
+    '''
+
+    :param gamma: Exponent of the modulating factor (1 - p_t)^gamma
+    :param alpha: Weight factor for the positive class
+    :param from_logits: whether the input is a logit or a probability
+    :return: Focal loss function
+    '''
+    def focal_loss_with_logits(logits, targets):
+        y_pred = tf.sigmoid(logits)
+        loss = targets * (-alpha * tf.pow((1 - y_pred), gamma) * tf.math.log(y_pred)) + \
+               (1 - targets) * (-alpha * tf.pow(y_pred, gamma) * tf.math.log(1 - y_pred))
+        return tf.reduce_sum(loss)
+
+    def focal_loss_with_probs(probs, targets):
+        '''
+        References :Lee, J.-W., & Kang, H.-S. (2024). Three-Stage Deep Learning Framework for Video Surveillance. Applied Sciences (2076-3417), 14(1), 408. https://doi-org.lopes.idm.oclc.org/10.3390/app14010408
+
+        :param probs: y_pred from the model (predicted probabilities)
+        :param targets: y_true from the model (true labels)
+        :return: Focal loss
+        '''
+        eps = 1e-7
+        loss = targets * (-alpha * tf.pow((1 - probs), gamma) * tf.math.log(probs + eps)) + \
+               (1 - targets) * (-alpha * tf.pow(probs, gamma) * tf.math.log(1 - probs + eps))
+        return tf.reduce_sum(loss)
+
+    return focal_loss_with_logits if from_logits else focal_loss_with_probs
+
+
+# loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
+loss_fn = focal_loss()
+
+# Prediction
+train_accumulated_predictions = tf.Variable(tf.zeros((1, 101), dtype=tf.float32))
+val_accumulated_predictions = tf.Variable(tf.zeros((1, 101), dtype=tf.float32))
+
+initial_learning_rate = 0.05
+lr_schedule = ExponentialDecay(initial_learning_rate, decay_steps=100000, decay_rate=0.96, staircase=True)
+optimizer = AdamW(learning_rate=lr_schedule,
+                  # weight_decay=1e-4, beta_1=0.9, beta_2=0.999,
+                  # epsilon=1e-07,
+                  amsgrad=False, name='AdamW')
+
+
 @tf.function
-def train_step(model, sequence_generator, label, loss_fn, optimizer, train_sequence_metrics, train_video_metrics,
-               sequences_read, accumulated_loss, accumulated_gradients, accumulated_predictions):
-    sequences_read.assign(0)
-    accumulated_loss.assign(0.0)
-    averaged_predictions = tf.zeros_like(accumulated_predictions)
+def train_by_sequence_step(model, sequence_generator, label):
+    global train_accumulated_predictions
+    global train_video_loss_metric
+    global train_sequence_loss_metric
 
-    # Initialize aggregated predictions tensor
-    accumulated_predictions.assign(tf.zeros_like(accumulated_predictions))
+    # load train metrics
+    global train_video_accuracy
+    global train_video_recall
+    global train_video_precision
+    global train_video_f1_score
+    global train_seq_accuracy
+    global train_seq_recall
+    global train_seq_precision
+    global train_seq_f1_score
+    global loss_fn
 
-    for ag in accumulated_gradients:
-        ag.assign(tf.zeros_like(ag))
-
-    flip = tf.random.uniform(shape=[], minval=0, maxval=2, dtype=tf.int32) < 1
-    # Define the RandomRotation layer with a small range (-10 to 10 degrees)
-    # Degrees are specified in fractions of 2π, so 10 degrees is about 10/360 = 0.0277
-    rotation_layer = keras_cv.layers.RandomRotation(factor=(-0.0277, 0.0277))
+    train_accumulated_predictions.assign(tf.zeros_like(train_accumulated_predictions))
 
     for sequence in sequence_generator:
-        sequences_read.assign_add(1)
+
         # Generate a random boolean tensor for grayscale conversion
-        to_grayscale = tf.random.uniform(shape=[], minval=0, maxval=2, dtype=tf.int32) < 1
-
-        frame_tensor = tf.cast(sequence, tf.float32) / 255.0
-
-        # Conditionally flip the image horizontally
-        frame_tensor = tf.cond(flip,
-                               lambda: tf.image.flip_left_right(frame_tensor),
-                               lambda: frame_tensor)
-
-        frame_tensor = rotation_layer(frame_tensor)
-
-        # Adjust brightness and contrast
-        frame_tensor = tf.image.random_hue(frame_tensor, max_delta=0.08)
-        frame_tensor = tf.image.random_saturation(frame_tensor, lower=0.7, upper=1.3)
-        frame_tensor = tf.image.random_brightness(frame_tensor, max_delta=0.05)
-        frame_tensor = tf.image.random_contrast(frame_tensor, lower=0.7, upper=1.3)
-
-        # adding gaussian noise
-        frame_tensor = frame_tensor + tf.random.normal(tf.shape(frame_tensor), mean=0.0, stddev=0.1, dtype=tf.float16)
-        # keras_cv.layers.RandomGaussianBlur(0.1)
-
-        # Conditionally convert to grayscale and then back to RGB
-
-        frame_tensor = tf.cond(to_grayscale,
-                               lambda: tf.image.grayscale_to_rgb(tf.image.rgb_to_grayscale(frame_tensor)),
-                               lambda: frame_tensor)
-
-        # Clip values to ensure they are within [0, 1]
-        frame_tensor = tf.clip_by_value(frame_tensor, 0.0, 1.0)
-        frame_tensor = tf.image.resize(frame_tensor, (240, 320))
-
-        frame_tensor = preprocess_input(frame_tensor)
-        frame_tensor = tf.expand_dims(frame_tensor, axis=0)
-
         with tf.GradientTape() as tape:
-            prediction = model(frame_tensor, training=True)
-            accumulated_predictions.assign_add(prediction)
-            averaged_predictions = accumulated_predictions / tf.cast(sequences_read, tf.float32)
-            sequence_loss = loss_fn(label, averaged_predictions)
+            prediction = model(sequence, training=True)
+            loss = loss_fn(label, prediction)
+
+        train_sequence_loss_metric.update_state(loss)
+        train_accumulated_predictions.assign_add(prediction)
 
         # Aggregate predictions by summing
-        gradients = tape.gradient(sequence_loss, model.trainable_variables)
-        for i, (ag, g) in enumerate(zip(accumulated_gradients, gradients)):
-            if g is not None:
-                accumulated_gradients[i].assign_add(g)
+        gradients = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
-        accumulated_loss.assign_add(sequence_loss)
-
-        for metric in train_sequence_metrics:
-            metric.update_state(label, tf.one_hot(tf.argmax(prediction, axis=-1), depth=101))
+        # Update train sequence metrics
+        for metric in [train_seq_accuracy, train_seq_recall, train_seq_precision, train_seq_f1_score]:
+            metric.update_state(label, prediction)
 
     # Update validation metrics
-    for metric in train_video_metrics:
-        metric.update_state(label, tf.one_hot(tf.argmax(averaged_predictions, axis=-1), depth=101))
+    for metric in [train_video_accuracy, train_video_recall, train_video_precision, train_video_f1_score]:
+        metric.update_state(label, tf.nn.softmax(train_accumulated_predictions, axis=-1))
 
-    # Apply gradients
-    avg_gradients = [ag / tf.cast(sequences_read, tf.float32) for ag in accumulated_gradients]
-    optimizer.apply_gradients(zip(avg_gradients, model.trainable_variables))
+    train_video_loss_metric.update_state(train_sequence_loss_metric.result())
 
     model.reset_states()
 
-    return accumulated_loss, sequences_read, averaged_predictions
+    return
 
 
 @tf.function
-def validation_step(model, sequence_generator, label, loss_fn, val_sequence_metrics, val_video_metrics, sequences_read,
-                    accumulated_loss, accumulated_predictions):
-    sequences_read.assign(0)
-    accumulated_loss.assign(0.0)
-    averaged_predictions = tf.zeros_like(accumulated_predictions)
+def val_by_sequence_step(model, sequence_generator, label):
+    global val_accumulated_predictions
+    global val_video_loss_metric
+    global val_sequence_loss_metric
 
-    # Initialize aggregated predictions tensor
-    accumulated_predictions.assign(tf.zeros_like(accumulated_predictions))
+    # load train metrics
+    global val_video_accuracy
+    global val_video_recall
+    global val_video_precision
+    global val_video_f1_score
+    global val_seq_accuracy
+    global val_seq_recall
+    global val_seq_precision
+    global val_seq_f1_score
+    global loss_fn
+
+    val_accumulated_predictions.assign(tf.zeros_like(val_accumulated_predictions))
 
     for sequence in sequence_generator:
-        sequences_read.assign_add(1)
-        frame_tensor = tf.cast(sequence, tf.float32) / 255.0
-        # use vg19 preprocess_input
-        frame_tensor = preprocess_input(frame_tensor)
+        # Generate a random boolean tensor for grayscale conversion
+        with tf.GradientTape() as tape:
+            prediction = model(sequence, training=False)
+            loss = loss_fn(label, prediction)
 
-        # No data augmentation for validation
-        frame_tensor = tf.clip_by_value(frame_tensor, 0.0, 1.0)
-        frame_tensor = tf.image.resize(frame_tensor, (240, 320))
-        frame_tensor = tf.expand_dims(frame_tensor, axis=0)
+        val_sequence_loss_metric.update_state(loss)
+        val_accumulated_predictions.assign_add(prediction)
 
-        # No gradient tape needed as we're not computing gradients during validation
-        prediction = model(frame_tensor, training=False)
-        accumulated_predictions.assign_add(prediction)
-        averaged_predictions = accumulated_predictions / tf.cast(sequences_read, tf.float32)
-        sequence_loss = loss_fn(label, averaged_predictions)
+        # Aggregate predictions by summing
+        gradients = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
-        accumulated_loss.assign_add(sequence_loss)
-
-        for metric in val_sequence_metrics:
-            metric.update_state(label, tf.one_hot(tf.argmax(prediction, axis=-1), depth=101))
+        # Update train sequence metrics
+        for metric in [val_seq_accuracy, val_seq_recall, val_seq_precision, val_seq_f1_score]:
+            metric.update_state(label, prediction)
 
     # Update validation metrics
-    for metric in val_video_metrics:
-        metric.update_state(label, tf.one_hot(tf.argmax(averaged_predictions, axis=-1), depth=101))
+    for metric in [val_video_accuracy, val_video_recall, val_video_precision, val_video_f1_score]:
+        metric.update_state(label, tf.nn.softmax(val_accumulated_predictions, axis=-1))
+
+    val_video_loss_metric.update_state(val_sequence_loss_metric.result())
 
     model.reset_states()
 
-    return accumulated_loss, sequences_read, averaged_predictions
+    return
 
 
-def create_video_dataset(video_path, label, frame_height, frame_width, channels, sequence_length):
-    # Create a dataset for a single video using from_generator
-    video_ds = tf.data.Dataset.from_generator(
-        lambda vp=VideoProcessor(video_path, preprocess_input, (frame_height, frame_width, channels),
-                                 False): vp.standardize_fetch_generator(25, sequence_length),
-        output_signature=tf.TensorSpec(shape=(sequence_length, frame_height, frame_width, channels), dtype=tf.float32)
-    )
+def create_video_dataset(video_path: str, label: tf.Tensor, frame_shape: Tuple[int, int, int] = (240, 320, 3),
+                         training=True) -> Tuple[tf.data.Dataset, tf.Tensor]:
+    def generator():
+        vp = VideoProcessor(video_path, target_shape=frame_shape, training=training)
+        for sequence in vp.standardize_fetch_generator(SEQUENCE_LENGTH):
+            yield tf.expand_dims(sequence, axis=0)
 
-    # Apply transformations
-    video_ds = video_ds.map(lambda x: tf.expand_dims(x, axis=0), num_parallel_calls=tf.data.AUTOTUNE)
+    video_ds = tf.data.Dataset.from_generator(generator,
+                                              output_signature=tf.TensorSpec(shape=(1,
+                                                                                    SEQUENCE_LENGTH, frame_shape[0],
+                                                                                    frame_shape[1], frame_shape[2]),
+                                                                             dtype=tf.float32)
+                                              ).map(lambda x: x, num_parallel_calls=tf.data.AUTOTUNE).prefetch(
+        tf.data.AUTOTUNE)
 
-    # Prefetch to improve efficiency
-    video_ds = video_ds.prefetch(tf.data.AUTOTUNE)
-
-    # Expand the label dimensions to match the video data
-    label_ds = tf.data.Dataset.from_tensors(tf.expand_dims(label, axis=0))
-
-    # Zip the video dataset with the label dataset
-    video_label_ds = tf.data.Dataset.zip((video_ds, label_ds))
-
-    return video_label_ds
-
-
-def print_summary_line(video_read, portion_size, loss_accumulated, sequence_read, sequence_metrics):
-    sequence_metrics_values = {metric.name: metric.result().numpy() for metric in sequence_metrics}
-    percentage = video_read / portion_size * 100
-    summary_format = '\rCompleted: {}/{}, ({:.2f}%). Loss: {:.4f}\tSequence Metrics: {}'  # \tOn video path: {}'
-
-    average_loss = loss_accumulated / tf.cast(sequence_read, tf.float32)
-
-    sequence_metrics_str = ', '.join(
-        f'{name}: {value:.4f}' for name, value in sequence_metrics_values.items())
-
-    # Format the summary line with actual values
-    summary_line = summary_format.format(video_read, portion_size, percentage,
-                                         average_loss,
-                                         sequence_metrics_str)  # , video_path)
-
-    # Print the summary line, overwriting the previous one
-    print(summary_line, end='', flush=True)
-
-
-def print_summary_line_threaded(video_read, portion_size, loss_accumulated, sequence_read, sequence_metrics):
-    global summary_thread
-    summary_thread = None
-
-    # Only start a new thread if the previous one has finished
-    if summary_thread is None or not summary_thread.is_alive():
-        summary_thread = threading.Thread(target=print_summary_line, args=(
-            video_read, portion_size, loss_accumulated, sequence_read, sequence_metrics))
-        summary_thread.start()
+    label_ds = tf.expand_dims(tf.cast(label, tf.float32), axis=0)
+    return video_ds, label_ds
 
 
 def train_model(load_previous_model=False):
+    # get global variables
+    global train_video_accuracy
+    global train_video_recall
+    global train_video_precision
+    global train_video_f1_score
+    global train_seq_accuracy
+    global train_seq_recall
+    global train_seq_precision
+    global train_seq_f1_score
+    global val_video_accuracy
+    global val_video_recall
+    global val_video_precision
+    global val_video_f1_score
+    global val_seq_accuracy
+    global val_seq_recall
+    global val_seq_precision
+    global val_seq_f1_score
+    global train_video_loss_metric
+    global val_video_loss_metric
+    global train_sequence_loss_metric
+    global val_sequence_loss_metric
+
+    global loss_fn
+    global optimizer
+
     # Model parameters
-    global video_metrics_values, sequence_metrics_values
     num_frames, frame_width, frame_height, channels, num_classes = SEQUENCE_LENGTH, 320, 240, 3, 101
     lstm_units = best_hyperparameters['lstm_units']
     dense_units = best_hyperparameters['dense_units']
 
-    def create_video_dataset(video_path, label, processor, sequence_length):
-        video_ds = tf.data.Dataset.from_generator(
-            lambda vp=VideoProcessor(video_path, preprocess_input, (frame_height, frame_width, channels),
-                                     True): vp.standardize_fetch_generator(25, SEQUENCE_LENGTH),
-            # Use a lambda to capture the current VideoProcessor instance
-            output_signature=tf.TensorSpec(shape=(SEQUENCE_LENGTH, frame_height, frame_width, channels),
-                                           dtype=tf.float32)
-        ).map(lambda x: x,
-              num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
-
-        label_ds = tf.expand_dims(tf.cast(label, tf.float32), axis=0)
-        return video_ds, label_ds, video_path
-
     if load_previous_model:
         model = load_model(MODEL_SAVE_PATH, custom_objects={'SpatialAttentionLayer': SpatialAttentionLayer,
-                                                            'TemporalAttentionLayer': TemporalAttentionLayer})
+                                                            'TemporalAttentionLayer': TemporalAttentionLayer,
+                                                            'focal_loss_with_probs': focal_loss(gamma=2., alpha=.25, from_logits=False)})
     else:
         model = ActionDetectionModel(1, num_frames, frame_width, frame_height, channels,
                                      num_classes, lstm_units, dense_units,
                                      dropout_rate=DROP_RATE,
                                      fine_tune_until=best_hyperparameters['fine_tune_at'])
 
-    initial_learning_rate = 0.05
-    lr_schedule = ExponentialDecay(initial_learning_rate, decay_steps=100000, decay_rate=0.96, staircase=True)
-    optimizer = AdamW(learning_rate=lr_schedule, weight_decay=1e-4, beta_1=0.9, beta_2=0.999,
-                      epsilon=1e-07, amsgrad=False, name='AdamW')
-
     log_dir = "logs/tf_function_training/"
 
     callbacks = [
-        ModelCheckpoint(MODEL_SAVE_PATH, monitor='val_loss', verbose=1, save_best_only=True, mode='min'),
+        ModelCheckpoint(MODEL_SAVE_PATH, monitor='val_loss', verbose=1, save_best_only=True, mode='min',
+                        initial_value_threshold=7.81551),
         TensorBoard(log_dir=log_dir + "ActionDetectionModel", histogram_freq=1,
-                    update_freq='batch'),
-        EarlyStopping(monitor='val_loss', patience=5, mode='min'),
+                    update_freq='epoch', write_images=True, embeddings_freq=1),
+        EarlyStopping(monitor='val_loss', patience=15, mode='min'),
         ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3)
     ]
-
-    # metrics
-
-    # Compile the model with learning rate schedule
-    loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
 
     for callback in callbacks:
         callback.set_model(model)
@@ -418,54 +439,17 @@ def train_model(load_previous_model=False):
     model.compile(optimizer=optimizer, loss=loss_fn,
                   metrics=['accuracy', 'categorical_accuracy', 'recall', 'precision'])
 
-    # create metrics per video
-    train_video_metrics = [tf.keras.metrics.CategoricalAccuracy(name='video_accuracy'),
-                           tf.keras.metrics.Recall(name='recall'),
-                           tf.keras.metrics.Precision(name='precision')]
-    val_video_metrics = [tf.keras.metrics.CategoricalAccuracy(name='video_accuracy'),
-                         tf.keras.metrics.Recall(name='recall'),
-                         tf.keras.metrics.Precision(name='precision')]
-    train_sequence_metrics = [tf.keras.metrics.CategoricalAccuracy(name='accuracy'),
-                              tf.keras.metrics.Recall(name='recall'),
-                              tf.keras.metrics.Precision(name='precision')]
-    val_sequence_metrics = [tf.keras.metrics.CategoricalAccuracy(name='val_accuracy'),
-                            tf.keras.metrics.Recall(name='val_recall'),
-                            tf.keras.metrics.Precision(name='val_precision')]
-
-    train_loss_metric = tf.keras.metrics.Mean(name='train_loss')
-    val_loss_metric = tf.keras.metrics.Mean(name='val_loss')
-
-    train_paths_sample = train_paths[:len(train_paths)]
-    val_path_sample = test_paths[:len(test_paths)]
-
-    def create_datasets(paths_sample, is_training):
-        if is_training:
-            return [create_video_dataset(path, tf.keras.utils.to_categorical(tf.argmax(label), num_classes=101),
-                                         VideoProcessor(path, preprocess_input,
-                                                        (frame_height, frame_width, channels),
-                                                        is_training), SEQUENCE_LENGTH) for path, label in
-                    random.sample(paths_sample, len(paths_sample))]
-        else:  # validation
-            return [create_video_dataset(path, tf.keras.utils.to_categorical(tf.argmax(label), num_classes=101),
-                                         VideoProcessor(path, preprocess_input,
-                                                        (frame_height, frame_width, channels),
-                                                        is_training), SEQUENCE_LENGTH) for path, label in
-                    random.sample(paths_sample, len(paths_sample))]
-
-    accumulative_loss_tensor = tf.Variable(0.0, dtype=tf.float32)
-    accumulative_gradients_tensor = [tf.Variable(tf.zeros_like(tv, dtype=tf.float32)) for tv in
-                                     model.trainable_variables]
-    sequences_read_tensor = tf.Variable(0, dtype=tf.int32)
-    accumulated_predictions_tensor = tf.Variable(tf.zeros((1, num_classes), dtype=tf.float32))
-
-    logs = {'best': 101.12650, 'lr': optimizer.learning_rate.numpy()}
+    logs = {'lr': optimizer.learning_rate.numpy()}
     for callback in callbacks:
         callback.on_train_begin(logs=logs)
 
     summary_format = ('\rCompleted: {}/{}, ({:.2f}%). Loss: {:.4f}, Accumulative Loss: {:.4f}\tSequence Metrics: {}'
                       '\tVideo Metrics: {}')
 
-    model.run_eagerly = False
+    train_sequence_metrics = [train_seq_accuracy, train_seq_recall, train_seq_precision, train_seq_f1_score]
+    val_sequence_metrics = [val_seq_accuracy, val_seq_recall, val_seq_precision, val_seq_f1_score]
+    train_video_metrics = [train_video_accuracy, train_video_recall, train_video_precision, train_video_f1_score]
+    val_video_metrics = [val_video_accuracy, val_video_recall, val_video_precision, val_video_f1_score]
 
     print('\a')
     for epoch in range(EPOCHS):
@@ -475,84 +459,74 @@ def train_model(load_previous_model=False):
             for metric in metrics:
                 metric.reset_states()
 
-        for loss in [train_loss_metric, val_loss_metric]:
+        for loss in [train_video_loss_metric, val_video_loss_metric, train_sequence_loss_metric,
+                     val_sequence_loss_metric]:
             loss.reset_states()
 
         logs = {'epoch': epoch + 1}
         for callback in callbacks:
             callback.on_epoch_begin(epoch, logs=logs)
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            train_future = executor.submit(create_datasets, train_paths_sample, True)
-            val_future = executor.submit(create_datasets, val_path_sample, False)
+        train_paths_sample = random.sample(train_paths, len(train_paths) // 10)
+        val_path_sample = random.sample(test_paths, len(test_paths) // 10)
 
-            # Wait for both threads to finish
-            concurrent.futures.wait([train_future, val_future])
-
-            # Retrieve the results
-            train_video_datasets = train_future.result()
-            val_video_datasets = val_future.result()
-            random.shuffle(train_video_datasets)
-            random.shuffle(val_video_datasets)
-
-        # random sample of the training dataset
-        train_portion = random.sample(train_video_datasets, len(train_video_datasets) // 3)
-
+        loader = VideoLoader(train_paths_sample, max_queue_size=20, target_shape=(240, 320, 3), training=True)
+        loader.start_loading()
+        train_portion_size = len(train_paths_sample)
         videos_read = 0
-        train_portion_size = len(train_portion)
-
-        # every video in the training dataset
-        for video_sequence_set, label, video_path in train_portion:
+        while videos_read < train_portion_size:
+            video_sequence_set, label = loader.get_next_video()
+            if video_sequence_set is None:
+                break
+            train_by_sequence_step(model, video_sequence_set, label)
             videos_read += 1
-            loss, sequence_read, ave_predictions = train_step(model, video_sequence_set, label, loss_fn, optimizer,
-                                                              train_sequence_metrics, train_video_metrics,
-                                                              sequences_read_tensor, accumulative_loss_tensor,
-                                                              accumulative_gradients_tensor,
-                                                              accumulated_predictions_tensor)
-            train_loss_metric.update_state(loss)
-
             sequence_metrics_values = {metric.name: metric.result().numpy() for metric in train_sequence_metrics}
             video_metrics_values = {metric.name: metric.result().numpy() for metric in train_video_metrics}
-            loss_value = train_loss_metric.result()
+            sequence_loss_value = train_sequence_loss_metric.result()
+            video_loss_value = train_video_loss_metric.result()
+
             percentage = videos_read / train_portion_size * 100
 
-            output = summary_format.format(videos_read, train_portion_size, percentage, loss, loss_value,
+            output = summary_format.format(videos_read, train_portion_size, percentage, sequence_loss_value,
+                                           video_loss_value,
                                            sequence_metrics_values, video_metrics_values)
-            print(output, end='', flush=True)
+            print(output, end=' ', flush=True)
 
         print('\nValidation')
         val_video_read = 0
-        # sample of the validation dataset
-        val_portion = random.sample(val_video_datasets, len(val_video_datasets) // 3)
-        val_portion_size = len(val_portion)
 
-        # every video in the training dataset
-        for video_sequence_set, label, video_path in val_portion:
-            accumulated_loss, sequences_read, averaged_predictions = validation_step(model, video_sequence_set, label,
-                                                                                     loss_fn, val_sequence_metrics,
-                                                                                     val_video_metrics,
-                                                                                     sequences_read_tensor,
-                                                                                     accumulative_loss_tensor,
-                                                                                     accumulated_predictions_tensor)
+        val_loader = VideoLoader(val_path_sample, max_queue_size=20, target_shape=(240, 320, 3), training=False)
+        val_loader.start_loading()
+        val_portion_size = len(val_path_sample)
+        while val_video_read < val_portion_size:
+            video_sequence_set, label = val_loader.get_next_video()
+            if video_sequence_set is None:
+                break
+            val_by_sequence_step(model, video_sequence_set, label)
             val_video_read += 1
-            val_loss_metric.update_state(accumulated_loss)
-
             sequence_metrics_values = {metric.name: metric.result().numpy() for metric in val_sequence_metrics}
             video_metrics_values = {metric.name: metric.result().numpy() for metric in val_video_metrics}
-            loss_value = val_loss_metric.result()
+            sequence_loss_value = val_sequence_loss_metric.result()
+            video_loss_value = val_video_loss_metric.result()
+
             percentage = val_video_read / val_portion_size * 100
 
-            output = summary_format.format(val_video_read, val_portion_size, percentage, accumulated_loss, loss_value,
+            output = summary_format.format(val_video_read, val_portion_size, percentage, sequence_loss_value,
+                                           video_loss_value,
                                            sequence_metrics_values, video_metrics_values)
-            print(output, end='', flush=True)
+            print(output, end=' ', flush=True)
 
-        logs = {'loss': train_loss_metric.result().numpy(), 'val_loss': val_loss_metric.result().numpy(),
-                'accuracy': video_metrics_values['video_accuracy'],
-                'val_accuracy': video_metrics_values['video_accuracy'],
-                'recall': video_metrics_values['recall'],
-                'val_recall': video_metrics_values['recall'],
-                'precision': video_metrics_values['precision'],
-                'val_precision': video_metrics_values['precision']}
+        logs = {}
+        logs.update({
+            'loss': train_video_loss_metric.result().numpy(),
+            'val_loss': val_video_loss_metric.result().numpy(),
+            'seq_loss': train_sequence_loss_metric.result().numpy(),
+            'val_seq_loss': val_sequence_loss_metric.result().numpy(),
+            **{metric.name: metric.result().numpy() for metric in train_sequence_metrics},
+            **{metric.name: metric.result().numpy() for metric in val_sequence_metrics},
+            **{metric.name: metric.result().numpy() for metric in train_video_metrics},
+            **{metric.name: metric.result().numpy() for metric in val_video_metrics},
+        })
 
         for callback in callbacks:
             callback.on_epoch_end(epoch, logs=logs)

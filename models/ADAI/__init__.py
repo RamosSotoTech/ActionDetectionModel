@@ -1,4 +1,5 @@
 import tensorflow as tf
+from keras.src.layers import Bidirectional
 from tensorflow.keras.applications import VGG19
 from tensorflow.keras.layers import Layer, Input
 from tensorflow.keras.layers import Multiply, Conv2D
@@ -54,7 +55,9 @@ class TemporalAttentionLayer(Layer):
         self.kernel = self.add_weight(name='kernel',
                                       shape=(input_shape[-1], 1),
                                       initializer='glorot_uniform',
-                                      trainable=True, regularizer=tf.keras.regularizers.l1_l2(l1=1e-5, l2=1e-4))
+                                      trainable=True,
+                                      regularizer=tf.keras.regularizers.l1_l2(l1=1e-5, l2=1e-4)
+                                      )
 
     def call(self, inputs):
         attention_scores = tf.keras.backend.dot(inputs, self.kernel)
@@ -108,9 +111,9 @@ def ActionDetectionModel_Phase1(num_frames, frame_width, frame_height, channels,
 
     # Load the VGG19 model
     base_model = VGG19(include_top=False, weights='imagenet', input_shape=(frame_height, frame_width, channels))
-    if fine_tune_until:
-        for layer in base_model.layers[:-fine_tune_until]:
-            layer.trainable = False
+    # if fine_tune_until:
+    #     for layer in base_model.layers[:-fine_tune_until]:
+    #         layer.trainable = False
 
     # TimeDistributed VGG19 model for frame feature extraction
     td_base_model = TimeDistributed(base_model)(video_input)
@@ -118,6 +121,7 @@ def ActionDetectionModel_Phase1(num_frames, frame_width, frame_height, channels,
         td_base_model)
     td_pooling = TimeDistributed(GlobalAveragePooling2D())(td_attention)
     td_flatten = TimeDistributed(Flatten())(td_pooling)
+    # td_flatten = TimeDistributed(Flatten())(td_base_model)
 
     lstm = LSTM(lstm_units, return_sequences=False, stateful=False, dropout=0.5, recurrent_dropout=0.5,
                 kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4),
@@ -127,8 +131,8 @@ def ActionDetectionModel_Phase1(num_frames, frame_width, frame_height, channels,
     # Following layers
     batch_norm = BatchNormalization()(lstm)
     dense_layer = Dense(dense_units, activation='relu')(batch_norm)
-    dropout = Dropout(dropout_rate)(dense_layer)
-    predictions = Dense(num_classes, activation='softmax')(dropout)
+    # dropout = Dropout(dropout_rate)(dense_layer)
+    predictions = Dense(num_classes, activation='softmax')(dense_layer)
 
     # Construct the final model
     model = Model(inputs=video_input, outputs=predictions)
@@ -156,10 +160,17 @@ def ActionDetectionModel(batch_size, num_frames, frame_width, frame_height, chan
     td_pooling = TimeDistributed(GlobalAveragePooling2D())(td_attention)
     td_flatten = TimeDistributed(Flatten())(td_pooling)
 
-    lstm = LSTM(lstm_units, return_sequences=False, stateful=True, dropout=0.5, recurrent_dropout=0.5,
-                kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4),
-                recurrent_regularizer=l1_l2(l1=1e-5, l2=1e-4),
-                bias_regularizer=l1_l2(l2=1e-4), name='lstm')(td_flatten)
+    # lstm = LSTM(lstm_units, return_sequences=False, stateful=True, dropout=0.5, recurrent_dropout=0.5,
+    #             # kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4),
+    #             # recurrent_regularizer=l1_l2(l1=1e-5, l2=1e-4),
+    #             # bias_regularizer=l1_l2(l2=1e-4),
+    #             name='lstm')(td_flatten)
+    lstm = Bidirectional(LSTM(lstm_units, return_sequences=False, stateful=False, dropout=0.5, recurrent_dropout=0.5,
+                          # kernel_regularizer=l1_l2(l1=1e-5, l2=1e-4),
+                          # recurrent_regularizer=l1_l2(l1=1e-5, l2=1e-4),
+                          # bias_regularizer=l1_l2(l2=1e-4)
+                          ),
+                          name='lstm')(td_flatten)
 
     # Following layers
     batch_norm = BatchNormalization()(lstm)
